@@ -5,19 +5,20 @@ use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::mem::size_of;
+use std::sync::Arc;
 
 use crate::ann::RandomProjectionIndex;
 use crate::config::{Number, State};
 use crate::vector_ops::{compute_cosine_similarity_simd, normalize_vector};
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct VectorEntry {
     pub label: String,
     pub vector: Vec<Number>,
     pub metadata: Metadata,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct Metadata {
     pub file_path: String,
     pub file_name: String,
@@ -28,7 +29,7 @@ pub struct Metadata {
 }
 
 pub struct Database {
-    mmap: Mmap,
+    mmap: Arc<Mmap>,
     pub record_count: usize,
     vector_size: usize,
     label_size: usize,
@@ -46,40 +47,18 @@ impl Database {
             .with_context(|| format!("Failed to open or create database file '{}'", state.path))?;
 
         let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = Arc::new(mmap);
 
-        let mut offsets = Vec::new();
-        let mut pos = 0;
-        let mmap_len = mmap.len();
-
-        while pos < mmap_len {
-            offsets.push(pos);
-            let vector_size = state.vector_size;
-            let label_size = state.label_size;
-
-            let metadata_length_bytes = &mmap[pos + vector_size + label_size..pos + vector_size + label_size + 4];
-            let metadata_length = u32::from_le_bytes(metadata_length_bytes.try_into().unwrap()) as usize;
-
-            let total_size = vector_size + label_size + 4 + metadata_length;
-            pos += total_size;
-        }
-
+        let offsets = Self::build_offsets(&mmap, state.vector_size, state.label_size)?;
         let record_count = offsets.len();
 
-        let mut ann_index = if state.search_method == "ann" {
-            Some(RandomProjectionIndex::new(
-                state.dimensions,
-                state.ann_num_projections,
-            ))
+        let ann_index = if state.search_method == "ann" {
+            let mut index = RandomProjectionIndex::new(state.dimensions, state.ann_num_projections);
+            Self::build_ann_index(&mmap, &offsets, state.vector_size, &mut index)?;
+            Some(index)
         } else {
             None
         };
-
-        if let Some(index) = &mut ann_index {
-            for i in 0..record_count {
-                let vector = Self::get_vector_from_mmap(&mmap, &offsets, i, state.vector_size)?;
-                index.add(&vector);
-            }
-        }
 
         Ok(Self {
             mmap,
@@ -91,31 +70,45 @@ impl Database {
         })
     }
 
-    fn get_vector_from_mmap(
-        mmap: &Mmap,
-        offsets: &[usize],
-        index: usize,
-        vector_size: usize,
-    ) -> Result<Vec<Number>> {
-        let start = offsets[index];
-        let end = start + vector_size;
+    fn build_offsets(mmap: &Mmap, vector_size: usize, label_size: usize) -> Result<Vec<usize>> {
+        let mut offsets = Vec::new();
+        let mut pos = 0;
+        let mmap_len = mmap.len();
+
+        while pos < mmap_len {
+            offsets.push(pos);
+            let metadata_length_bytes = &mmap[pos + vector_size + label_size..pos + vector_size + label_size + 4];
+            let metadata_length = u32::from_le_bytes(metadata_length_bytes.try_into().unwrap()) as usize;
+            let total_size = vector_size + label_size + 4 + metadata_length;
+            pos += total_size;
+        }
+
+        Ok(offsets)
+    }
+
+    fn build_ann_index(mmap: &Mmap, offsets: &[usize], vector_size: usize, index: &mut RandomProjectionIndex) -> Result<()> {
+        for &offset in offsets {
+            let vector = Self::get_vector_from_mmap(mmap, offset, vector_size)?;
+            index.add(&vector);
+        }
+        Ok(())
+    }
+
+    fn get_vector_from_mmap(mmap: &Mmap, offset: usize, vector_size: usize) -> Result<Vec<Number>> {
+        let end = offset + vector_size;
         if end > mmap.len() {
             anyhow::bail!("Attempted to read beyond the memory map.");
         }
-        let vector_bytes = &mmap[start..end];
+        let vector_bytes = &mmap[offset..end];
         let vector = vector_bytes
             .chunks_exact(size_of::<Number>())
-            .map(|b| {
-                Ok(Number::from_le_bytes(b.try_into().map_err(|_| {
-                    anyhow::anyhow!("Failed to read number from bytes")
-                })?))
-            })
-            .collect::<Result<Vec<Number>>>()?;
+            .map(|b| Number::from_le_bytes(b.try_into().unwrap()))
+            .collect();
         Ok(vector)
     }
 
     pub fn get_vector(&self, index: usize) -> Result<Vec<Number>> {
-        Self::get_vector_from_mmap(&self.mmap, &self.offsets, index, self.vector_size)
+        Self::get_vector_from_mmap(&self.mmap, self.offsets[index], self.vector_size)
     }
 
     pub fn get_label(&self, index: usize) -> Result<String> {
@@ -125,10 +118,7 @@ impl Database {
             anyhow::bail!("Attempted to read beyond the memory map.");
         }
         let label_bytes = &self.mmap[start..end];
-        let label_end = label_bytes
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(self.label_size);
+        let label_end = label_bytes.iter().position(|&b| b == 0).unwrap_or(self.label_size);
         let label = String::from_utf8_lossy(&label_bytes[..label_end]).to_string();
         Ok(label)
     }
@@ -144,47 +134,36 @@ impl Database {
         let start = self.offsets[index] + self.vector_size + self.label_size;
         let mut cursor = &self.mmap[start..];
 
-        // Read the length of the metadata
         let mut length_bytes = [0u8; 4];
         length_bytes.copy_from_slice(&cursor[..4]);
         let metadata_length = u32::from_le_bytes(length_bytes) as usize;
         cursor = &cursor[4..];
 
-        // Read the metadata JSON
         let metadata_json = std::str::from_utf8(&cursor[..metadata_length])?;
         let metadata: Metadata = serde_json::from_str(metadata_json)?;
         Ok(metadata)
     }
 
     pub fn search(&self, query_vector: &[Number], state: &State) -> Result<Vec<(Number, String, usize, Vec<Number>, Metadata)>> {
-        if let Some(ann_index) = self.ann_index.as_ref() {
+        let search_range = if let Some(ann_index) = self.ann_index.as_ref() {
             crate::config::verbose_print("Using ANN search method");
-            let candidate_indices = ann_index.search(query_vector, state.top_k * 50);
-            candidate_indices
-                .into_par_iter()
-                .map(|i| -> Result<_> {
-                    let mut vector = self.get_vector(i)?;
-                    let label = self.get_label(i)?;
-                    let metadata = self.get_metadata(i)?;
-                    normalize_vector(&mut vector);
-                    let similarity = compute_cosine_similarity_simd(query_vector, &vector);
-                    Ok((similarity, label, i, vector, metadata))
-                })
-                .collect::<Result<Vec<_>>>()
+            ann_index.search(query_vector, state.top_k * 50)
         } else {
             crate::config::verbose_print("Using exact search method");
-            (0..self.record_count)
-                .into_par_iter()
-                .map(|i| -> Result<_> {
-                    let mut vector = self.get_vector(i)?;
-                    let label = self.get_label(i)?;
-                    let metadata = self.get_metadata(i)?;
-                    normalize_vector(&mut vector);
-                    let similarity = compute_cosine_similarity_simd(query_vector, &vector);
-                    Ok((similarity, label, i, vector, metadata))
-                })
-                .collect::<Result<Vec<_>>>()
-        }
+            (0..self.record_count).collect()
+        };
+
+        search_range
+            .into_par_iter()
+            .map(|i| -> Result<_> {
+                let mut vector = self.get_vector(i)?;
+                let label = self.get_label(i)?;
+                let metadata = self.get_metadata(i)?;
+                normalize_vector(&mut vector);
+                let similarity = compute_cosine_similarity_simd(query_vector, &vector);
+                Ok((similarity, label, i, vector, metadata))
+            })
+            .collect()
     }
 }
 
@@ -206,9 +185,7 @@ pub fn serialize_chunk(entry: &VectorEntry, label_size: usize) -> Result<Vec<u8>
     let mut chunk = Vec::with_capacity(entry.vector.len() * size_of::<Number>() + label_size);
 
     // Serialize vector
-    for &num in &entry.vector {
-        chunk.extend(&num.to_le_bytes());
-    }
+    chunk.extend(entry.vector.iter().flat_map(|&num| num.to_le_bytes()));
 
     // Serialize label with padding
     let label_bytes = entry.label.as_bytes();
@@ -220,7 +197,7 @@ pub fn serialize_chunk(entry: &VectorEntry, label_size: usize) -> Result<Vec<u8>
         );
     }
     chunk.extend(label_bytes);
-    chunk.resize(entry.vector.len() * size_of::<Number>() + label_size, 0); // Padding with zeros
+    chunk.resize(entry.vector.len() * size_of::<Number>() + label_size, 0);
 
     // Serialize metadata
     let metadata_json = serde_json::to_string(&entry.metadata)?;
