@@ -6,10 +6,16 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::mem::size_of;
 use std::sync::Arc;
-
+use bincode;
+use std::time::Instant;
+use std::path::Path;
 use crate::ann::RandomProjectionIndex;
 use crate::config::{Number, State};
 use crate::vector_ops::{compute_cosine_similarity_simd, normalize_vector};
+use heed::EnvOpenOptions;
+use heed::types::*;
+use std::fs;
+use std::path::PathBuf;
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct VectorEntry {
@@ -28,17 +34,86 @@ pub struct Metadata {
     pub content_preview: String,
 }
 
-pub struct Database {
+pub struct LmdbWrapper {
+    env: heed::Env,
+    db: heed::Database<Str, SerdeBincode<Vec<u8>>>,
+}
+
+impl LmdbWrapper {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = PathBuf::from(path.as_ref());
+        
+        // Explicitly create the directory
+        fs::create_dir_all(&path)
+            .with_context(|| format!("Failed to create directory for LMDB at '{}'", path.display()))?;
+
+        println!("Attempting to open LMDB at: {}", path.display());
+
+        // Open the environment
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .map_size(10 * 1024 * 1024 * 1024) // 10GB
+                .max_dbs(1)
+                .open(&path)
+                .with_context(|| format!("Failed to open LMDB environment at '{}'", path.display()))?
+        };
+
+        // Create the database
+        let mut wtxn = env.write_txn()
+            .with_context(|| "Failed to create write transaction for LMDB")?;
+        let db: heed::Database<Str, SerdeBincode<Vec<u8>>> = env.create_database(&mut wtxn, None)
+            .with_context(|| "Failed to create LMDB database")?;
+        wtxn.commit()
+            .with_context(|| "Failed to commit initial LMDB transaction")?;
+
+        Ok(Self { env, db })
+    }
+
+    pub fn add(&self, key: &str, value: &[u8]) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.db.put(&mut wtxn, key, &value.to_vec())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.db.get(&rtxn, key)?.map(|v| v.to_vec()))
+    }
+
+    pub fn iter(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let rtxn = self.env.read_txn()?;
+        let iter_result: Vec<(String, Vec<u8>)> = self.db
+            .iter(&rtxn)?
+            .map(|result| {
+                result.map(|(k, v)| (k.to_string(), v.to_vec()))
+            })
+            .collect::<std::result::Result<Vec<_>, heed::Error>>()?;
+        
+        Ok(iter_result) // Return the result after the transaction is done
+    }
+    
+}
+
+pub struct VectorDatabase {
     mmap: Arc<Mmap>,
     pub record_count: usize,
     vector_size: usize,
     label_size: usize,
     ann_index: Option<RandomProjectionIndex>,
     offsets: Vec<usize>,
+    lmdb: LmdbWrapper,
 }
 
-impl Database {
+impl VectorDatabase {
     pub fn open(state: &State) -> Result<Self> {
+        println!("Opening database at path: {}", state.path);
+        // Ensure the directory exists
+        let path = PathBuf::from(&state.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("Failed to create directory for '{}'", state.path))?;
+        }
+
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -60,6 +135,12 @@ impl Database {
             None
         };
 
+        println!("Creating LMDB at path: {}_lmdb", state.path);
+        let lmdb_path = format!("{}_lmdb", state.path);
+        let lmdb = LmdbWrapper::new(&lmdb_path)
+            .with_context(|| format!("Failed to create or open LMDB at '{}'", lmdb_path))?;
+
+        println!("Successfully opened database and created LMDB");
         Ok(Self {
             mmap,
             record_count,
@@ -67,6 +148,7 @@ impl Database {
             label_size: state.label_size,
             ann_index,
             offsets,
+            lmdb,
         })
     }
 
@@ -144,7 +226,45 @@ impl Database {
         Ok(metadata)
     }
 
-    pub fn search(&self, query_vector: &[Number], state: &State) -> Result<Vec<(Number, String, usize, Vec<Number>, Metadata)>> {
+    pub fn add_entry_lmdb(&self, entry: &VectorEntry) -> Result<()> {
+        let value = bincode::serialize(entry)?;
+        self.lmdb.add(&entry.label, &value)
+    }
+
+    pub fn get_entry_lmdb(&self, label: &str) -> Result<Option<VectorEntry>> {
+        if let Some(value) = self.lmdb.get(label)? {
+            Ok(Some(bincode::deserialize(&value)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn search(&self, query_vector: &[Number], state: &State) -> Result<(Vec<(Number, String, usize, Vec<Number>, Metadata)>, SearchTimings)> {
+        let start = Instant::now();
+        let mut timings = SearchTimings::default();
+
+        // Memory-mapped search
+        let mmap_start = Instant::now();
+        let mut results = self.search_mmap(query_vector, state)?;
+        timings.mmap_duration = mmap_start.elapsed();
+
+        // LMDB search
+        let lmdb_start = Instant::now();
+        results.extend(self.search_lmdb(query_vector, state)?);
+        timings.lmdb_duration = lmdb_start.elapsed();
+
+        // Sort and truncate results
+        let sort_start = Instant::now();
+        results.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(state.top_k);
+        timings.sort_duration = sort_start.elapsed();
+
+        timings.total_duration = start.elapsed();
+
+        Ok((results, timings))
+    }
+
+    fn search_mmap(&self, query_vector: &[Number], state: &State) -> Result<Vec<(Number, String, usize, Vec<Number>, Metadata)>> {
         let search_range = if let Some(ann_index) = self.ann_index.as_ref() {
             crate::config::verbose_print("Using ANN search method");
             ann_index.search(query_vector, state.top_k * 50)
@@ -153,7 +273,8 @@ impl Database {
             (0..self.record_count).collect()
         };
 
-        search_range
+        let start = Instant::now();
+        let results = search_range
             .into_par_iter()
             .map(|i| -> Result<_> {
                 let mut vector = self.get_vector(i)?;
@@ -163,8 +284,70 @@ impl Database {
                 let similarity = compute_cosine_similarity_simd(query_vector, &vector);
                 Ok((similarity, label, i, vector, metadata))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        let duration = start.elapsed();
+        crate::config::verbose_print(&format!("Mmap search took {:?}", duration));
+        Ok(results)
     }
+
+    fn search_lmdb(&self, query_vector: &[Number], _state: &State) -> Result<Vec<(Number, String, usize, Vec<Number>, Metadata)>> {
+        let start = Instant::now();
+        let entries = self.lmdb.iter()?;
+        let results: Result<Vec<_>> = entries
+            .par_iter()
+            .map(|(key, value)| -> Result<_> {
+                let entry: VectorEntry = bincode::deserialize(value)?;
+                let mut vector = entry.vector.clone();
+                normalize_vector(&mut vector);
+                let similarity = compute_cosine_similarity_simd(query_vector, &vector);
+                Ok((similarity, key.clone(), 0, vector, entry.metadata))
+            })
+            .collect();
+        let results = results?;
+        let duration = start.elapsed();
+        crate::config::verbose_print(&format!("LMDB search took {:?}", duration));
+        Ok(results)
+    }
+
+    pub fn list_entries_lmdb(&self) -> Result<Vec<String>> {
+        let rtxn = self.lmdb.env.read_txn()?;
+        let iter = self.lmdb.db.iter(&rtxn)?;
+        let entries: Result<Vec<_>, _> = iter.map(|res| res.map(|(k, _)| k.to_string())).collect();
+        Ok(entries?)
+    }
+
+    pub fn migrate_to_lmdb(&self) -> Result<()> {
+        for i in 0..self.record_count {
+            let label = self.get_label(i)?;
+            let vector = self.get_vector(i)?;
+            let metadata = self.get_metadata(i)?;
+            let entry = VectorEntry {
+                label: label.clone(),
+                vector,
+                metadata,
+            };
+            self.add_entry_lmdb(&entry)?;
+        }
+        Ok(())
+    }
+
+    pub fn migrate_to_mmap(&self, path: &str) -> Result<()> {
+        let entries = self.lmdb.iter()?;
+        for (_, value) in entries {
+            let entry: VectorEntry = bincode::deserialize(&value)?;
+            let chunk = serialize_chunk(&entry, self.label_size)?;
+            append_to_db(path, &chunk)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SearchTimings {
+    pub mmap_duration: std::time::Duration,
+    pub lmdb_duration: std::time::Duration,
+    pub sort_duration: std::time::Duration,
+    pub total_duration: std::time::Duration,
 }
 
 pub fn parse_input_line(line: &str, state: &State) -> Result<VectorEntry> {

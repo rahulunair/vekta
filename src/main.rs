@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::io::{self, BufRead};
 
 use crate::config::State;
-use crate::database::{Database, parse_input_line, serialize_chunk, append_to_db};
+use crate::database::{VectorDatabase, parse_input_line, serialize_chunk, append_to_db};
 use crate::vector_ops::normalize_vector;
 
 #[derive(Parser)]
@@ -27,12 +27,14 @@ enum Commands {
     List,
     Search,
     Config,
+    Migrate { to: String }, // New command to migrate data
 }
 
 fn add_command(state: &State) -> Result<()> {
     let stdin = io::stdin();
     let reader = stdin.lock();
     let mut added_labels = HashSet::new();
+    let mut db = VectorDatabase::open(state)?;
 
     reader.lines().try_for_each(|line_result| -> Result<()> {
         let line = line_result?;
@@ -42,15 +44,20 @@ fn add_command(state: &State) -> Result<()> {
             return Ok(());
         }
         normalize_vector(&mut entry.vector);
+        
+        // Add to memory-mapped file
         let chunk = serialize_chunk(&entry, state.label_size)?;
         append_to_db(&state.path, &chunk)?;
+        
+        // Add to LMDB
+        db.add_entry_lmdb(&entry)?;
+        
         added_labels.insert(entry.label.clone());
         config::verbose_print(&format!("Added vector with label '{}'", entry.label));
         Ok(())
     })?;
 
-    // Reopen the database to update the memory map and ANN index
-    let mut db = Database::open(state)?;
+    // Update ANN index
     for i in 0..db.record_count {
         let vector = db.get_vector(i)?;
         db.add_to_ann(&vector);
@@ -60,11 +67,20 @@ fn add_command(state: &State) -> Result<()> {
 }
 
 fn list_command(state: &State) -> Result<()> {
-    let db = Database::open(state)?;
+    let db = VectorDatabase::open(state)?;
+    
+    println!("Memory-mapped file entries:");
     for i in 0..db.record_count {
         let label = db.get_label(i)?;
         println!("{}", label);
     }
+    
+    println!("\nLMDB entries:");
+    let lmdb_entries = db.list_entries_lmdb()?;
+    for entry in lmdb_entries {
+        println!("{}", entry);
+    }
+    
     Ok(())
 }
 
@@ -77,13 +93,14 @@ fn search_command(state: &State) -> Result<()> {
 
     normalize_vector(&mut query_vector);
 
-    let db = Database::open(state)?;
-    let results = db.search(&query_vector, state)?;
+    let db = VectorDatabase::open(state)?;
+    let (results, timings) = db.search(&query_vector, &state)?;
 
-    config::verbose_print(&format!(
-        "All similarities: {:?}",
-        results.iter().map(|(s, l, _, _, _)| (l, s)).collect::<Vec<_>>()
-    ));
+    println!("Search timings:");
+    println!("  Mmap search: {:?}", timings.mmap_duration);
+    println!("  LMDB search: {:?}", timings.lmdb_duration);
+    println!("  Sort duration: {:?}", timings.sort_duration);
+    println!("  Total duration: {:?}", timings.total_duration);
 
     let output = serde_json::json!({
         "query": {
@@ -113,15 +130,27 @@ fn config_command(state: &State) -> Result<()> {
     Ok(())
 }
 
+fn migrate_command(state: &State, to: &str) -> Result<()> {
+    let db = VectorDatabase::open(state)?;
+    match to {
+        "lmdb" => db.migrate_to_lmdb()?,
+        "mmap" => db.migrate_to_mmap(&state.path)?,
+        _ => anyhow::bail!("Invalid migration target. Use 'lmdb' or 'mmap'."),
+    }
+    println!("Migration completed successfully.");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Cli::parse();
     let state = State::new()?;
 
-    match args.command {
+    match &args.command {
         Commands::Add => add_command(&state)?,
         Commands::List => list_command(&state)?,
         Commands::Search => search_command(&state)?,
         Commands::Config => config_command(&state)?,
+        Commands::Migrate { to } => migrate_command(&state, to)?,
     }
     Ok(())
 }
