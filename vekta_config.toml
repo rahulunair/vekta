@@ -6,4 +6,3 @@ top_k = 5
 
 [search]
 method = "exact"  # Can be "exact" or "ann"
-ann_num_projections = 10  # Only used if method is "ann"

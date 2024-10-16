@@ -15,7 +15,8 @@ pub struct VektaConfig {
     pub label_size: Option<usize>,
     pub top_k: Option<usize>,
     pub search_method: Option<String>,
-    pub ann_num_projections: Option<usize>,
+    //pub ann_num_projections: Option<usize>,
+    //pub ann_num_tables: Option<usize>,
 }
 
 impl VektaConfig {
@@ -26,7 +27,8 @@ impl VektaConfig {
             label_size: config.get("label_size").ok(),
             top_k: config.get("top_k").ok(),
             search_method: config.get("search_method").ok(),
-            ann_num_projections: config.get("ann_num_projections").ok(),
+            //ann_num_projections: config.get("ann_num_projections").ok(),
+            //ann_num_tables: config.get("ann_num_tables").ok(),
         })
     }
 }
@@ -39,7 +41,7 @@ pub struct State {
     pub chunk_size: usize,
     pub top_k: usize,
     pub search_method: String,
-    pub ann_num_projections: usize,
+    pub similarity_threshold: Number,
 }
 
 impl State {
@@ -60,12 +62,20 @@ impl State {
 
         let dimensions = vekta_config
             .dimensions
-            .or_else(|| env::var("VEKTA_DIMENSIONS").ok().and_then(|s| s.parse().ok()))
+            .or_else(|| {
+                env::var("VEKTA_DIMENSIONS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
             .context("VEKTA_DIMENSIONS not set in config or environment")?;
 
         let label_size = vekta_config
             .label_size
-            .or_else(|| env::var("VEKTA_LABEL_SIZE").ok().and_then(|s| s.parse().ok()))
+            .or_else(|| {
+                env::var("VEKTA_LABEL_SIZE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
             .context("VEKTA_LABEL_SIZE not set in config or environment")?;
 
         let top_k = vekta_config
@@ -78,10 +88,10 @@ impl State {
             .or_else(|| env::var("VEKTA_SEARCH_METHOD").ok())
             .unwrap_or_else(|| "exact".to_string());
 
-        let ann_num_projections = vekta_config
-            .ann_num_projections
-            .or_else(|| env::var("VEKTA_ANN_NUM_PROJECTIONS").ok().and_then(|s| s.parse().ok()))
-            .unwrap_or(10);
+        let similarity_threshold = env::var("VEKTA_SIMILARITY_THRESHOLD")
+            .unwrap_or_else(|_| "0.0".to_string()) // Set to 0.0 for testing
+            .parse()
+            .context("Failed to parse VEKTA_SIMILARITY_THRESHOLD")?;
 
         if dimensions % 8 != 0 {
             anyhow::bail!("VEKTA_DIMENSIONS must be a multiple of 8.");
@@ -98,7 +108,7 @@ impl State {
             chunk_size,
             top_k,
             search_method,
-            ann_num_projections,
+            similarity_threshold,
         })
     }
 
@@ -110,7 +120,7 @@ impl State {
         println!("chunk_size={}", self.chunk_size);
         println!("top_k={}", self.top_k);
         println!("search_method={}", self.search_method);
-        println!("ann_num_projections={}", self.ann_num_projections);
+        println!("similarity_threshold={}", self.similarity_threshold);
     }
 }
 

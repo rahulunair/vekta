@@ -1,15 +1,18 @@
+mod ann;
 mod config;
 mod database;
+mod search;
+mod vector_entry;
 mod vector_ops;
-mod ann;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::HashSet;
 use std::io::{self, BufRead};
 
 use crate::config::State;
-use crate::database::{VectorDatabase, parse_input_line, serialize_chunk, append_to_db};
+use crate::database::{parse_input_line, VectorDatabase};
+use crate::search::SearchEngine;
 use crate::vector_ops::normalize_vector;
 
 #[derive(Parser)]
@@ -27,40 +30,44 @@ enum Commands {
     List,
     Search,
     Config,
-    Migrate { to: String }, // New command to migrate data
 }
 
 fn add_command(state: &State) -> Result<()> {
     let stdin = io::stdin();
     let reader = stdin.lock();
-    let mut added_labels = HashSet::new();
     let mut db = VectorDatabase::open(state)?;
+    let mut added_labels = HashSet::new();
 
-    reader.lines().try_for_each(|line_result| -> Result<()> {
-        let line = line_result?;
-        let mut entry = parse_input_line(&line, state)?;
-        if added_labels.contains(&entry.label) {
-            eprintln!("Warning: Duplicate label '{}' found. Skipping.", entry.label);
-            return Ok(());
+    for (i, line_result) in reader.lines().enumerate() {
+        let line = line_result.context("Failed to read input line")?;
+        println!("Processing line {}: {}", i, line);
+        let mut entry = parse_input_line(&line, state)
+            .with_context(|| format!("Failed to parse input line: {}", line))?;
+
+        if db.label_exists(&entry.label)? {
+            eprintln!(
+                "Warning: Label '{}' already exists in the database. Skipping.",
+                entry.label
+            );
+            continue;
         }
-        normalize_vector(&mut entry.vector);
-        
-        // Add to memory-mapped file
-        let chunk = serialize_chunk(&entry, state.label_size)?;
-        append_to_db(&state.path, &chunk)?;
-        
-        // Add to LMDB
-        db.add_entry_lmdb(&entry)?;
-        
-        added_labels.insert(entry.label.clone());
-        config::verbose_print(&format!("Added vector with label '{}'", entry.label));
-        Ok(())
-    })?;
 
-    // Update ANN index
-    for i in 0..db.record_count {
-        let vector = db.get_vector(i)?;
-        db.add_to_ann(&vector);
+        if added_labels.contains(&entry.label) {
+            eprintln!(
+                "Warning: Duplicate label '{}' found in current input. Skipping.",
+                entry.label
+            );
+            continue;
+        }
+
+        normalize_vector(&mut entry.vector);
+
+        let result = db
+            .add_entry(&entry) // Pass a reference to entry
+            .with_context(|| format!("Failed to add entry with label: {}", entry.label))?;
+
+        added_labels.insert(entry.label.clone());
+        config::verbose_print(&format!("Added vector with label '{}'", result));
     }
 
     Ok(())
@@ -68,59 +75,64 @@ fn add_command(state: &State) -> Result<()> {
 
 fn list_command(state: &State) -> Result<()> {
     let db = VectorDatabase::open(state)?;
-    
-    println!("Memory-mapped file entries:");
-    for i in 0..db.record_count {
-        let label = db.get_label(i)?;
-        println!("{}", label);
-    }
-    
-    println!("\nLMDB entries:");
-    let lmdb_entries = db.list_entries_lmdb()?;
+
+    println!("LMDB entries:");
+    let lmdb_entries = db.list_entries()?;
     for entry in lmdb_entries {
         println!("{}", entry);
     }
-    
+
     Ok(())
 }
 
 fn search_command(state: &State) -> Result<()> {
-    config::verbose_print("Starting search");
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let query_entry = parse_input_line(&input, state)?;
-    let mut query_vector = query_entry.vector;
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("Failed to read input")?;
 
-    normalize_vector(&mut query_vector);
+    if input.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "Error: No input provided for the search query."
+        ));
+    }
+
+    let query_entry =
+        parse_input_line(&input, state).context("Failed to parse input as a valid query")?;
+    let query_vector = &query_entry.vector;
 
     let db = VectorDatabase::open(state)?;
-    let (results, timings) = db.search(&query_vector, &state)?;
+    println!("Debug: Database opened, record count: {}", db.count()?);
 
-    println!("Search timings:");
-    println!("  Mmap search: {:?}", timings.mmap_duration);
-    println!("  LMDB search: {:?}", timings.lmdb_duration);
-    println!("  Sort duration: {:?}", timings.sort_duration);
-    println!("  Total duration: {:?}", timings.total_duration);
+    let search_engine = SearchEngine::new(db, state)?;
+    let (results, timings) = search_engine.search(query_vector, state)?;
 
     let output = serde_json::json!({
         "query": {
             "label": query_entry.label,
+            "unique_id": query_entry.unique_id,
             "vector": &query_vector[..5.min(query_vector.len())],
             "metadata": query_entry.metadata,
         },
-        "database_record_count": db.record_count,
-        "results": results.iter().map(|(similarity, label, _, _, metadata)| {
+        "database_record_count": search_engine.db.count()?,
+        "results": results.iter().map(|result| {
             serde_json::json!({
-                "label": label,
-                "similarity": similarity,
-                "metadata": metadata,
+                "label": result.label,
+                "unique_id": result.unique_id,
+                "similarity": result.similarity,
+                "metadata": result.metadata,
             })
         }).collect::<Vec<_>>(),
         "actual_results_count": results.len(),
-        "requested_results_count": state.top_k
+        "requested_results_count": state.top_k,
+        "timings": {
+            "search_duration_ms": timings.search_duration.as_millis(),
+            "sort_duration_ms": timings.sort_duration.as_millis(),
+            "total_duration_ms": timings.total_duration.as_millis(),
+        }
     });
 
-    println!("{}", serde_json::to_string(&output)?);
+    println!("{}", serde_json::to_string_pretty(&output)?);
 
     Ok(())
 }
@@ -130,27 +142,21 @@ fn config_command(state: &State) -> Result<()> {
     Ok(())
 }
 
-fn migrate_command(state: &State, to: &str) -> Result<()> {
-    let db = VectorDatabase::open(state)?;
-    match to {
-        "lmdb" => db.migrate_to_lmdb()?,
-        "mmap" => db.migrate_to_mmap(&state.path)?,
-        _ => anyhow::bail!("Invalid migration target. Use 'lmdb' or 'mmap'."),
-    }
-    println!("Migration completed successfully.");
-    Ok(())
-}
-
 fn main() -> Result<()> {
     let args = Cli::parse();
     let state = State::new()?;
 
-    match &args.command {
-        Commands::Add => add_command(&state)?,
-        Commands::List => list_command(&state)?,
-        Commands::Search => search_command(&state)?,
-        Commands::Config => config_command(&state)?,
-        Commands::Migrate { to } => migrate_command(&state, to)?,
+    let result = match &args.command {
+        Commands::Add => add_command(&state),
+        Commands::List => list_command(&state),
+        Commands::Search => search_command(&state),
+        Commands::Config => config_command(&state),
+    };
+
+    if let Err(e) = result {
+        eprintln!("Error: {:?}", e);
+        std::process::exit(1);
     }
+
     Ok(())
 }
