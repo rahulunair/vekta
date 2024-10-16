@@ -1,11 +1,14 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::prelude::*;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::collections::HashSet;
+
+const NUM_ELEMENTS: usize = 100; // Number of elements to add
+const NUM_QUERIES: usize = 10; // Number of queries to perform
 
 fn configure_criterion() -> Criterion {
     Criterion::default()
@@ -22,27 +25,24 @@ fn load_embeddings(c: &mut Criterion) {
         panic!("embeddings.jsonl not found. Run the Python script first.");
     }
 
-    env::set_var("VEKTA_PATH", "benchmark_db.bin");
+    env::set_var("VEKTA_PATH", "benchmark_db");
     env::set_var("VEKTA_DIMENSIONS", "384");
-    env::set_var("VEKTA_LABEL_SIZE", "32");
+    env::set_var("VEKTA_LABEL_SIZE", "64");
     env::set_var("VEKTA_TOP_K", "10");
-    env::set_var("VEKTA_ANN_NUM_PROJECTIONS", "20");
+    env::set_var("VEKTA_SEARCH_METHOD", "exact");
+    env::set_var("VEKTA_SIMILARITY_THRESHOLD", "0.0");
+    env::set_var("VEKTA_VERBOSE", "true");
 
-    c.bench_function("load embeddings", |b| {
+    c.bench_function(&format!("load {} embeddings", NUM_ELEMENTS), |b| {
         b.iter(|| {
             let file = File::open(embedding_file).unwrap();
             let reader = BufReader::new(file);
-            let mut added_labels = std::collections::HashSet::new();
 
-            for line in reader.lines() {
-                let line = line.unwrap();
-                let v: Value = serde_json::from_str(&line).unwrap();
-                let label = v["label"].as_str().unwrap();
-
-                if added_labels.contains(label) {
-                    continue;
+            for (i, line) in reader.lines().enumerate() {
+                if i >= NUM_ELEMENTS {
+                    break;
                 }
-
+                let line = line.unwrap();
                 let mut child = Command::new("./target/release/vekta")
                     .arg("add")
                     .stdin(Stdio::piped())
@@ -57,53 +57,63 @@ fn load_embeddings(c: &mut Criterion) {
 
                 let output = child.wait_with_output().expect("Failed to read stdout");
                 assert!(output.status.success());
-
-                added_labels.insert(label.to_string());
             }
         })
     });
 }
 
 fn search_embeddings(c: &mut Criterion) {
-    if !std::path::Path::new("benchmark_db.bin").exists() {
-        panic!("benchmark_db.bin not found. Run the load embeddings benchmark first.");
+    if !std::path::Path::new("benchmark_db").exists() {
+        panic!("benchmark_db directory not found. Run the load embeddings benchmark first.");
     }
 
-    env::set_var("VEKTA_PATH", "benchmark_db.bin");
+    let query_file = "query_embeddings.jsonl";
+    if !std::path::Path::new(query_file).exists() {
+        panic!("query_embeddings.jsonl not found. Create this file with query vectors.");
+    }
+
+    env::set_var("VEKTA_PATH", "benchmark_db");
     env::set_var("VEKTA_DIMENSIONS", "384");
-    env::set_var("VEKTA_LABEL_SIZE", "32");
+    env::set_var("VEKTA_LABEL_SIZE", "64");
     env::set_var("VEKTA_TOP_K", "10");
-    env::set_var("VEKTA_ANN_NUM_PROJECTIONS", "20");
+    env::set_var("VEKTA_SIMILARITY_THRESHOLD", "0.0");
+    env::set_var("VEKTA_VERBOSE", "true");
 
-    let file = File::open("embeddings.jsonl").unwrap();
+    let file = File::open(query_file).unwrap();
     let reader = BufReader::new(file);
-    let embeddings: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
-
-    let mut rng = rand::thread_rng();
+    let query_embeddings: Vec<String> = reader.lines().take(NUM_QUERIES).map(|l| l.unwrap()).collect();
 
     let mut group = c.benchmark_group("search_embeddings");
-    for search_method in ["exact", "ann"] {
-        group.bench_with_input(BenchmarkId::new("search", search_method), &search_method, |b, &search_method| {
-            b.iter(|| {
-                let query = embeddings.choose(&mut rng).unwrap();
-                env::set_var("VEKTA_SEARCH_METHOD", search_method);
-                run_search(query)
-            })
-        });
+    for search_method in ["exact", "ann", "hybrid"] {
+        group.bench_with_input(
+            BenchmarkId::new(&format!("search_{}_queries", NUM_QUERIES), search_method),
+            &search_method,
+            |b, &search_method| {
+                b.iter(|| {
+                    env::set_var("VEKTA_SEARCH_METHOD", search_method);
+                    for query in &query_embeddings {
+                        run_search(query);
+                    }
+                })
+            },
+        );
     }
     group.finish();
 
-    c.bench_function("search embeddings (exact vs ANN comparison)", |b| {
+    c.bench_function(&format!("compare_{}_searches", NUM_QUERIES), |b| {
         b.iter(|| {
-            let query = embeddings.choose(&mut rng).unwrap();
+            for query in &query_embeddings {
+                env::set_var("VEKTA_SEARCH_METHOD", "exact");
+                let exact_results = run_search(query);
 
-            env::set_var("VEKTA_SEARCH_METHOD", "exact");
-            let exact_results = run_search(query);
+                env::set_var("VEKTA_SEARCH_METHOD", "ann");
+                let ann_results = run_search(query);
 
-            env::set_var("VEKTA_SEARCH_METHOD", "ann");
-            let ann_results = run_search(query);
+                env::set_var("VEKTA_SEARCH_METHOD", "hybrid");
+                let hybrid_results = run_search(query);
 
-            compare_results(&exact_results, &ann_results);
+                compare_results(&exact_results, &ann_results, &hybrid_results);
+            }
         })
     });
 }
@@ -132,27 +142,65 @@ fn run_search(query: &str) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn compare_results(exact_results: &str, ann_results: &str) {
-    // Parse JSON results
-    for (method, results) in [("Exact", exact_results), ("ANN", ann_results)] {
-        let json: serde_json::Value = serde_json::from_str(results).expect(&format!("Failed to parse {} JSON", method));
-        
-        assert!(json.get("query_label").is_some(), "{} search: Output doesn't contain 'query_label'", method);
-        assert!(json.get("query_vector").is_some(), "{} search: Output doesn't contain 'query_vector'", method);
-        assert!(json.get("database_record_count").is_some(), "{} search: Output doesn't contain 'database_record_count'", method);
-        assert!(json.get("results").is_some(), "{} search: Output doesn't contain 'results'", method);
-        assert!(json.get("actual_results_count").is_some(), "{} search: Output doesn't contain 'actual_results_count'", method);
-        assert!(json.get("requested_results_count").is_some(), "{} search: Output doesn't contain 'requested_results_count'", method);
+fn compare_results(exact_results: &str, ann_results: &str, hybrid_results: &str) {
+    for (method, results) in [
+        ("Exact", exact_results),
+        ("ANN", ann_results),
+        ("Hybrid", hybrid_results),
+    ] {
+        let json: serde_json::Value =
+            serde_json::from_str(results).expect(&format!("Failed to parse {} JSON", method));
+
+        assert!(
+            json["query"]["label"].is_string(),
+            "{} search: Output doesn't contain 'query.label'",
+            method
+        );
+        assert!(
+            json["query"]["vector"].is_array(),
+            "{} search: Output doesn't contain 'query.vector'",
+            method
+        );
+        assert!(
+            json["database_record_count"].is_number(),
+            "{} search: Output doesn't contain 'database_record_count'",
+            method
+        );
+        assert!(
+            json["results"].is_array(),
+            "{} search: Output doesn't contain 'results'",
+            method
+        );
+        assert!(
+            json["actual_results_count"].is_number(),
+            "{} search: Output doesn't contain 'actual_results_count'",
+            method
+        );
+        assert!(
+            json["requested_results_count"].is_number(),
+            "{} search: Output doesn't contain 'requested_results_count'",
+            method
+        );
     }
 
-    // Extract and compare top results
     let exact_top = extract_top_results(exact_results);
     let ann_top = extract_top_results(ann_results);
+    let hybrid_top = extract_top_results(hybrid_results);
 
-    let overlap = exact_top.intersection(&ann_top).count();
-    let overlap_percentage = (overlap as f64 / exact_top.len() as f64) * 100.0;
+    let ann_overlap = exact_top.intersection(&ann_top).count();
+    let hybrid_overlap = exact_top.intersection(&hybrid_top).count();
 
-    println!("Overlap between exact and ANN results: {:.2}%", overlap_percentage);
+    let ann_overlap_percentage = (ann_overlap as f64 / exact_top.len() as f64) * 100.0;
+    let hybrid_overlap_percentage = (hybrid_overlap as f64 / exact_top.len() as f64) * 100.0;
+
+    println!(
+        "Overlap between exact and ANN results: {:.2}%",
+        ann_overlap_percentage
+    );
+    println!(
+        "Overlap between exact and hybrid results: {:.2}%",
+        hybrid_overlap_percentage
+    );
 }
 
 fn extract_top_results(results: &str) -> HashSet<String> {
