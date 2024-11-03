@@ -3,6 +3,8 @@ use rand_distr::{Distribution, Normal};
 use std::collections::{HashMap, HashSet};
 
 use crate::config::Number;
+use crate::vector_ops::compute_cosine_similarity_simd;
+use crate::database::VectorDatabase;
 
 const SEED: u64 = 42;
 const MIN_PROJECTIONS: usize = 2;
@@ -15,10 +17,11 @@ pub struct RandomProjectionIndex {
     hash_tables: Vec<HashMap<u64, Vec<usize>>>,
     num_tables: usize,
     num_projections: usize,
+    db: VectorDatabase,
 }
 
 impl RandomProjectionIndex {
-    pub fn new(dim: usize, data_size: usize) -> Self {
+    pub fn new(dim: usize, data_size: usize, db: &VectorDatabase) -> Self {
         let (num_projections, num_tables) = Self::calculate_params(data_size);
         println!(
             "Debug: Using {} projections and {} tables",
@@ -37,13 +40,14 @@ impl RandomProjectionIndex {
             hash_tables: vec![HashMap::new(); num_tables],
             num_tables,
             num_projections,
+            db: db.clone(),
         }
     }
 
     fn calculate_params(data_size: usize) -> (usize, usize) {
         let log_size = (data_size as f64).log2() as usize;
-        let num_projections = (log_size + 1).clamp(MIN_PROJECTIONS, MAX_PROJECTIONS);
-        let num_tables = (log_size / 2 + 1).clamp(MIN_TABLES, MAX_TABLES);
+        let num_projections = (log_size + 2).clamp(MIN_PROJECTIONS, MAX_PROJECTIONS);
+        let num_tables = (log_size / 2 + 2).clamp(MIN_TABLES, MAX_TABLES);
         (num_projections, num_tables)
     }
 
@@ -109,6 +113,7 @@ impl RandomProjectionIndex {
 
     pub fn search(&self, query: Vec<Number>, k: usize) -> Vec<usize> {
         let mut candidates = HashSet::new();
+        let similarity_threshold = 0.5; // Adjust this value as needed
 
         for i in 0..self.num_tables {
             let query_hash = self.hash_vector(&query, i);
@@ -125,26 +130,34 @@ impl RandomProjectionIndex {
 
             // Check neighboring buckets (multi-probe)
             for j in 0..self.num_projections {
-                let neighbor_hash = query_hash ^ (1 << j);
-                if let Some(bucket) = self.hash_tables[i].get(&neighbor_hash) {
-                    println!(
-                        "Debug: Found {} candidates in neighboring bucket (hash: {})",
-                        bucket.len(),
-                        neighbor_hash
-                    );
-                    candidates.extend(bucket);
+                for flip in 0..2 {
+                    let neighbor_hash = query_hash ^ (flip << j);
+                    if let Some(bucket) = self.hash_tables[i].get(&neighbor_hash) {
+                        println!(
+                            "Debug: Found {} candidates in neighboring bucket (hash: {})",
+                            bucket.len(),
+                            neighbor_hash
+                        );
+                        candidates.extend(bucket);
+                    }
                 }
             }
         }
 
-        println!("Debug: Total unique candidates found: {}", candidates.len());
+        // Filter candidates based on similarity
+        let filtered_candidates: Vec<usize> = candidates
+            .into_iter()
+            .filter(|&index| {
+                if let Ok(Some(entry)) = self.db.get_entry_by_index(index) {
+                    let similarity = compute_cosine_similarity_simd(&query, &entry.vector);
+                    similarity >= similarity_threshold
+                } else {
+                    false
+                }
+            })
+            .collect();
 
-        if candidates.is_empty() {
-            println!("Debug: No candidates found, returning all indices");
-            (0..self.hash_tables[0].values().map(|v| v.len()).sum()).collect()
-        } else {
-            candidates.into_iter().take(k).collect()
-        }
+        filtered_candidates.into_iter().take(k).collect()
     }
 
     pub fn print_hash_tables(&self) {
@@ -156,3 +169,4 @@ impl RandomProjectionIndex {
         }
     }
 }
+

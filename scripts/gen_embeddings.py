@@ -7,7 +7,7 @@ import random
 
 
 def create_embeddings(
-    dataset_name, split, text_column, num_samples=10000, output_file="embeddings.jsonl"
+    dataset_name, split, text_column, num_samples=100, output_file="embeddings.jsonl"
 ):
     logger.info(f"Starting embedding generation process")
     logger.info(f"Dataset: {dataset_name}, Split: {split}, Text column: {text_column}")
@@ -58,7 +58,7 @@ def create_embeddings(
     # Generate query embeddings
     logger.info("Generating query embeddings")
     query_embeddings = []
-    for j in range(100):
+    for j in range(10):
         idx = random.randint(0, len(embeddings) - 1)
         query = {
             "label": f"query_{j:03d}",

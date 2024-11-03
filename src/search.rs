@@ -37,7 +37,7 @@ impl SearchEngine {
 
     fn initialize_ann_index(db: &VectorDatabase, state: &State) -> Result<RandomProjectionIndex> {
         let data_size = db.count()?;
-        let mut index = RandomProjectionIndex::new(state.dimensions, data_size);
+        let index = RandomProjectionIndex::new(state.dimensions, data_size, db);
 
         println!("Debug: Initializing ANN index");
         let mut count = 0;
